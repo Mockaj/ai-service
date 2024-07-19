@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env*
+app/logs/app.log
+!app/logs/.gitkeep
+.idea/
+.DS_Store

@@ -1,0 +1,195 @@
+stages:
+  - build
+  - test
+  - deploy
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .cache/pip
+
+variables:
+  # Build variables
+  AZURE_CONTAINER_REGISTRY_PASSWORD: $AZURE_CONTAINER_REGISTRY_PASSWORD
+  AZURE_CONTAINER_REGISTRY_SERVER: $AZURE_CONTAINER_REGISTRY_SERVER
+  AZURE_CONTAINER_REGISTRY_NAME: $AZURE_CONTAINER_REGISTRY_NAME
+  IMAGE_TAG: "$CI_PROJECT_PATH_SLUG:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHA"
+
+  # Deploy variables
+  AZURE_CLIENT_ID: $AZURE_CLIENT_ID
+  AZURE_SECRET: $AZURE_SECRET
+  AZURE_TENANT_ID: $AZURE_TENANT_ID
+  AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+  AZURE_RESOURCE_GROUP: $AZURE_RESOURCE_GROUP
+  IMAGE_TAG_DEPLOY: $AZURE_CONTAINER_REGISTRY_SERVER/$IMAGE_TAG
+
+  CONTAINERAPPS_ENVIRONMENT_NAME: crm-microservices
+  CONTAINER_APP_NAME: "$CONTAINER_NAME-$CI_COMMIT_REF_SLUG"
+
+  # Environment variables
+  DATABASE_URL_DEV: "$DB_CONNECTION+pymysql://$DB_USERNAME_DEV:$DB_PASSWORD_DEV@$DB_HOST_DEV/$DB_DATABASE_DEV"
+  DATABASE_URL_PROD: "$DB_CONNECTION+pymysql://$DB_USERNAME_PROD:$DB_PASSWORD_PROD@$DB_HOST_PROD/$DB_DATABASE_PROD"
+
+BUILD_IMAGE:
+  stage: build
+  image: docker:latest
+  tags:
+    - dmzglrunners
+  services:
+    - docker:dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    # Login to Azure Container Registry
+    - echo $AZURE_CONTAINER_REGISTRY_PASSWORD | docker login $AZURE_CONTAINER_REGISTRY_SERVER --username $AZURE_CONTAINER_REGISTRY_NAME --password-stdin
+
+    # Pull the latest image to use as cache
+    - docker pull $AZURE_CONTAINER_REGISTRY_SERVER/$IMAGE_TAG || true
+
+    # Build Docker image with cache
+    - docker build --cache-from $AZURE_CONTAINER_REGISTRY_SERVER/$IMAGE_TAG -t $IMAGE_TAG .
+
+    # Build Docker image
+    # - docker build -t $IMAGE_TAG .
+
+    # Tag image for Azure Container Registry
+    - docker tag $IMAGE_TAG $AZURE_CONTAINER_REGISTRY_SERVER/$IMAGE_TAG
+
+    # Push image to Azure Container Registry
+    - docker push $AZURE_CONTAINER_REGISTRY_SERVER/$IMAGE_TAG
+  only:
+    - DEV
+    - PROD
+
+TEST:
+  stage: test
+  image: python:3.10-slim
+  services:
+    - docker:dind
+  tags:
+    - dmzglrunners
+  before_script:
+    - echo $AZURE_CONTAINER_REGISTRY_PASSWORD | docker login $AZURE_CONTAINER_REGISTRY_SERVER --username $AZURE_CONTAINER_REGISTRY_NAME --password-stdin
+    - docker pull $AZURE_CONTAINER_REGISTRY_SERVER/$IMAGE_TAG
+  script:
+    # Start the application container
+    - docker run -d --name app -p 9900:8000 $AZURE_CONTAINER_REGISTRY_SERVER/$IMAGE_TAG
+
+    # Wait for the application to be ready
+    - sleep 15
+
+    # Run tests
+    - docker exec app pytest --disable-warnings
+
+    # Stop the application container
+    - docker stop app
+    - docker rm app
+  only:
+    - DEV
+    - PROD
+
+DEPLOY_DEV:
+  stage: deploy
+  image: mcr.microsoft.com/azure-cli
+  script:
+    # Login to Azure CLI with Service Principal
+    - az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_SECRET --tenant $AZURE_TENANT_ID
+    - az account set --subscription $AZURE_SUBSCRIPTION_ID
+
+    # Check if the container app exists
+    - >
+      if ! az containerapp show --name $CONTAINER_APP_NAME --resource-group $AZURE_RESOURCE_GROUP; then
+        echo "Container app $CONTAINER_APP_NAME does not exist, creating..."
+        az containerapp create --name $CONTAINER_APP_NAME --resource-group $AZURE_RESOURCE_GROUP --image $IMAGE_TAG_DEPLOY --environment $CONTAINERAPPS_ENVIRONMENT_NAME \
+          --ingress external --target-port 8000 --registry-server $AZURE_CONTAINER_REGISTRY_SERVER \
+          --min-replicas 1 --max-replicas 5 --cpu 1 --memory 2Gi
+        # If creation fails, exit
+        if [ $? -ne 0 ]; then
+          echo "Failed to create container app $CONTAINER_APP_NAME, exiting..."
+          exit 1
+        fi
+      else
+        echo "Container app $CONTAINER_APP_NAME exists, updating..."
+      fi
+
+    # Set the secret for the database password
+    - az containerapp secret set --resource-group $AZURE_RESOURCE_GROUP --name $CONTAINER_APP_NAME --secrets api-key=$ELASTICSEARCH_API_KEY_DEV db-password=$DB_PASSWORD_DEV
+
+    # Update Container App with new image and environment variables
+    - >
+      az containerapp update 
+      --resource-group $AZURE_RESOURCE_GROUP 
+      --name $CONTAINER_APP_NAME 
+      --image $IMAGE_TAG_DEPLOY 
+      --set-env-vars
+      APP_ENV=$CI_COMMIT_REF_SLUG
+      APP_KEY=$APP_KEY
+      SCOUT_DRIVER=$SCOUT_DRIVER
+      ELASTICSEARCH_SSL=$ELASTICSEARCH_SSL
+      ELASTICSEARCH_API_KEY=secretref:api-key
+      ELASTICSEARCH_CLOUD_ID=$ELASTICSEARCH_CLOUD_ID_DEV
+      DB_HOST=$DB_HOST_DEV
+      DB_PORT=$DB_PORT_DEV
+      DB_DATABASE=$DB_DATABASE_DEV
+      DB_USERNAME=$DB_USERNAME_DEV
+      DB_PASSWORD=secretref:db-password
+
+    # Logout the Azure CLI
+    - az logout
+  only:
+    - DEV
+  tags:
+    - dmzglrunners
+
+DEPLOY_PROD:
+  stage: deploy
+  image: mcr.microsoft.com/azure-cli
+  script:
+    # Login to Azure CLI with Service Principal
+    - az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_SECRET --tenant $AZURE_TENANT_ID
+    - az account set --subscription $AZURE_SUBSCRIPTION_ID
+
+    # Check if the container app exists
+    - >
+      if ! az containerapp show --name $CONTAINER_APP_NAME --resource-group $AZURE_RESOURCE_GROUP; then
+        echo "Container app $CONTAINER_APP_NAME does not exist, creating..."
+        az containerapp create --name $CONTAINER_APP_NAME --resource-group $AZURE_RESOURCE_GROUP --image $IMAGE_TAG_DEPLOY --environment $CONTAINERAPPS_ENVIRONMENT_NAME \
+          --ingress external --target-port 8000 --registry-server $AZURE_CONTAINER_REGISTRY_SERVER \
+          --min-replicas 1 --max-replicas 5 --cpu 1 --memory 2Gi
+        # If creation fails, exit
+        if [ $? -ne 0 ]; then
+          echo "Failed to create container app $CONTAINER_APP_NAME, exiting..."
+          exit 1
+        fi
+      else
+        echo "Container app $CONTAINER_APP_NAME exists, updating..."
+      fi
+
+    # Set the secret for the database password
+    - az containerapp secret set --resource-group $AZURE_RESOURCE_GROUP --name $CONTAINER_APP_NAME --secrets api-key=$ELASTICSEARCH_API_KEY_PROD db-password=$DB_PASSWORD_PROD
+
+    # Update Container App with new image and environment variables
+    - >
+      az containerapp update 
+      --resource-group $AZURE_RESOURCE_GROUP 
+      --name $CONTAINER_APP_NAME 
+      --image $IMAGE_TAG_DEPLOY 
+      --set-env-vars 
+      APP_ENV=$CI_COMMIT_REF_SLUG
+      APP_KEY=$APP_KEY
+      SCOUT_DRIVER=$SCOUT_DRIVER
+      ELASTICSEARCH_SSL=$ELASTICSEARCH_SSL
+      ELASTICSEARCH_API_KEY=secretref:api-key
+      ELASTICSEARCH_CLOUD_ID=$ELASTICSEARCH_CLOUD_ID_PROD
+      DB_HOST=$DB_HOST_PROD
+      DB_PORT=$DB_PORT_PROD
+      DB_DATABASE=$DB_DATABASE_PROD
+      DB_USERNAME=$DB_USERNAME_PROD
+      DB_PASSWORD=secretref:db-password
+
+    # Logout the Azure CLI
+    - az logout
+  only:
+    - PROD
+  tags:
+    - dmzglrunners

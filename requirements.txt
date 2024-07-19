@@ -1,0 +1,14 @@
+requests
+fastapi
+uvicorn
+gunicorn
+python-dotenv
+mysql-connector-python
+aiohttp
+elasticsearch
+numpy
+torch
+sentence-transformers
+pytest
+pytest-asyncio
+pydantic
